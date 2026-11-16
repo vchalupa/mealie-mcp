@@ -1,0 +1,112 @@
+# Daily: rebase feat/recipe-tags onto upstream main, smoke-test, and publish
+# ghcr.io/<owner>/mealie-mcp:stable (+ an immutable up-<sha>-feat-<sha> tag).
+# Nothing is pushed back to git; a rebase conflict or failed test stops the run
+# before any image is published, so :stable only ever points at a tested build.
+name: Unraid build (upstream + feat/recipe-tags)
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this upstream + patch combination was already published
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: unraid-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/retr083/mealie-mcp.git
+  PATCH_BRANCH: feat/recipe-tags
+  IMAGE: ghcr.io/${{ github.repository_owner }}/mealie-mcp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+
+      - name: Rebase patch onto upstream main
+        id: src
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          patch_sha=$(git rev-parse HEAD)
+          if ! git rebase upstream/main; then
+            git rebase --abort
+            echo "::error::$PATCH_BRANCH no longer applies cleanly to upstream main ($upstream_sha). Rebase it manually."
+            exit 1
+          fi
+          tag="up-${upstream_sha::7}-feat-${patch_sha::7}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building $tag"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if already published
+        id: check
+        run: |
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:${{ steps.src.outputs.tag }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE:${{ steps.src.outputs.tag }} already exists; nothing to do."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          docker build \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.revision=${{ steps.src.outputs.upstream_sha }} \
+            --label org.opencontainers.image.version=${{ steps.src.outputs.tag }} \
+            -t "$IMAGE:${{ steps.src.outputs.tag }}" .
+
+      - name: Smoke test (server starts, tag tool registered)
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          docker run -d --name smoke -p 8000:8000 \
+            -e MEALIE_URL=http://127.0.0.1:9 -e MEALIE_API_TOKEN=ci-dummy \
+            -e PUBLIC_URL=http://127.0.0.1:8000 -e MCP_LOGIN_PASSWORD=ci-smoke-test-only \
+            "$IMAGE:${{ steps.src.outputs.tag }}"
+          for _ in $(seq 30); do curl -sf http://127.0.0.1:8000/ >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:8000/ || { docker logs smoke; exit 1; }
+          docker exec smoke python -c '
+          import asyncio
+          import mealie_mcp.server as s
+
+          async def main():
+              tools = {t.name: t for t in await s.mcp.list_tools()}
+              assert "set_recipe_tags" in tools, "set_recipe_tags missing"
+              assert "tags" in tools["import_recipe_from_url"].input_schema["properties"], "import tags param missing"
+              print(f"{len(tools)} tools OK")
+
+          asyncio.run(main())
+          '
+          docker logs smoke 2>&1 | grep -iE "traceback|error" && { docker logs smoke; exit 1; } || true
+
+      - name: Publish
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          docker push "$IMAGE:${{ steps.src.outputs.tag }}"
+          docker tag "$IMAGE:${{ steps.src.outputs.tag }}" "$IMAGE:stable"
+          docker push "$IMAGE:stable"
+          echo "### Published \`$IMAGE:${{ steps.src.outputs.tag }}\` as \`:stable\`" >> "$GITHUB_STEP_SUMMARY"
