@@ -1,0 +1,7 @@
+# Local build for Marbella: reuse the pinned upstream image (same Python, deps,
+# healthcheck and CMD) and only swap in this branch's application code.
+FROM ghcr.io/retr083/mealie-mcp:sha-608867c
+
+COPY pyproject.toml ./
+COPY mealie_mcp ./mealie_mcp
+RUN pip install --no-cache-dir --no-deps .
